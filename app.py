@@ -77,7 +77,7 @@ async def main():
         flask_app.run_task(host="0.0.0.0", port=PORT)
     )
 
-if name == "__main__":
+if __name__ == "__main__":
     import nest_asyncio; nest_asyncio.apply()
     logging.basicConfig(level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
