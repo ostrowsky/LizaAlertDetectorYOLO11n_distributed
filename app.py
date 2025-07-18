@@ -1,85 +1,105 @@
-# ---------------- app.py (полностью) ----------------
-import os, asyncio, logging, httpx, sys
+import os
+import logging
+import io
+import aiohttp
+import asyncio
 from datetime import datetime
-from flask import Flask, request, jsonify
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler,
-    MessageHandler, filters
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
+# === Конфигурация ===
 TG_TOKEN = os.getenv("TG_TOKEN")
-HF_URL   = os.getenv("HF_URL")          # https://space.hf.space/predict
-PORT     = int(os.getenv("PORT", 7860)) # Railway задаёт $PORT
+HF_URL = os.getenv("HF_URL")
 
 if not TG_TOKEN or not HF_URL:
     raise RuntimeError("TG_TOKEN и/или HF_URL не заданы в переменных среды")
 
-# ---------- HTTP-клиент к Hugging Face ----------
-async def call_hf(img_bytes: bytes) -> bytes:
-    async with httpx.AsyncClient(timeout=60) as cli:
-        r = await cli.post(
-            HF_URL, files={"image": ("img.jpg", img_bytes, "image/jpeg")}
-        )
-    r.raise_for_status()
-    return r.content
+# === Логирование ===
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 
-# ---------------- Telegram -----------------
-async def start(update: Update, _):
-    await update.message.reply_text("👋 Пришли фото — отмечу людей.")
+# === Telegram Bot Handlers ===
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"/start от пользователя {update.effective_user.id}")
+    await update.message.reply_text("📸 Отправьте изображение для анализа.")
 
-async def handle_img(update: Update, _):
-    photo = update.message.photo[-1]
-    img_bytes = await (await photo.get_file()).download_as_bytearray()
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        result = await call_hf(img_bytes)
-        await update.message.reply_photo(photo=result)
-    except Exception:
-        logging.exception("HF inference error")
-        await update.message.reply_text("⚠️ Ошибка инференса")
+        photo = update.message.photo[-1]
+        file = await photo.get_file()
+        image_bytes = await file.download_as_bytearray()
+        logging.info(f"📥 Получено изображение от {update.effective_user.id}, размер {len(image_bytes)} байт")
 
-async def handle_doc(update: Update, _):
-    if not update.message.document.mime_type.startswith("image/"):
-        return await update.message.reply_text("📄 Пришлите изображение.")
-    file = await update.message.document.get_file()
-    await handle_img(Update.de_json({"photo":[{"file_id":file.file_id}]}, _), _)
+        # Отправка в Hugging Face
+        async with aiohttp.ClientSession() as session:
+            form = aiohttp.FormData()
+            form.add_field("image", io.BytesIO(image_bytes), filename="image.jpg", content_type="image/jpeg")
 
-async def handle_other(update: Update, _):
-    await update.message.reply_text("📸 Отправьте изображение.")
+            async with session.post(HF_URL, data=form) as resp:
+                if resp.status != 200:
+                    logging.error(f"❌ Ошибка HF: код {resp.status}")
+                    await update.message.reply_text("⚠️ Ошибка инференса (HF недоступен).")
+                    return
 
-# -------------- Flask (index + predict) -------------
-flask_app = Flask(__name__)
+                result_bytes = await resp.read()
+                logging.info(f"✅ Получен результат от HF, размер {len(result_bytes)} байт")
+                await update.message.reply_photo(photo=io.BytesIO(result_bytes))
 
-@flask_app.route("/")
-def index():
-    return "✅ LizaAlert bot alive"
+    except Exception as e:
+        logging.exception("Ошибка при обработке изображения")
+        await update.message.reply_text("⚠️ Ошибка инференса.")
 
-# простой прокси для тестов (curl /predict -F image=@img.jpg)
-@flask_app.route("/predict", methods=["POST"])
-def predict():
-    if "image" not in request.files:
-        return jsonify(error="no image"), 400
-    img_bytes = request.files["image"].read()
-    result = asyncio.run(call_hf(img_bytes))
-    return result, 200, {"Content-Type":"image/jpeg"}
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not doc.mime_type or not doc.mime_type.startswith("image/"):
+        await update.message.reply_text("❗️ Пожалуйста, отправьте изображение.")
+        return
 
-# ---------- Запуск: Flask + long-polling -------------
+    try:
+        file = await doc.get_file()
+        image_bytes = await file.download_as_bytearray()
+        logging.info(f"📄 Получен документ-изображение от {update.effective_user.id}, размер {len(image_bytes)} байт")
+
+        # Отправка в HF
+        async with aiohttp.ClientSession() as session:
+            form = aiohttp.FormData()
+            form.add_field("image", io.BytesIO(image_bytes), filename="document.jpg", content_type="image/jpeg")
+
+            async with session.post(HF_URL, data=form) as resp:
+                if resp.status != 200:
+                    logging.error(f"❌ Ошибка HF (document): код {resp.status}")
+                    await update.message.reply_text("⚠️ Ошибка инференса (HF недоступен).")
+                    return
+
+                result_bytes = await resp.read()
+                logging.info(f"✅ Ответ HF (document), размер {len(result_bytes)} байт")
+                await update.message.reply_photo(photo=io.BytesIO(result_bytes))
+
+    except Exception as e:
+        logging.exception("Ошибка при обработке документа")
+        await update.message.reply_text("⚠️ Ошибка инференса.")
+
+async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📸 Пожалуйста, отправьте изображение.")
+
+# === Запуск бота ===
 async def main():
-    tg_app = ApplicationBuilder().token(TG_TOKEN).build()
-    tg_app.add_handler(CommandHandler("start", start))
-    tg_app.add_handler(MessageHandler(filters.PHOTO, handle_img))
-    tg_app.add_handler(MessageHandler(filters.Document.IMAGE, handle_doc))
-    tg_app.add_handler(MessageHandler(~(filters.PHOTO|filters.Document.IMAGE),
-                                      handle_other))
+    logging.info("🚀 Бот запускается...")
 
-    await asyncio.gather(
-        tg_app.run_polling(),
-        flask_app.run_task(host="0.0.0.0", port=PORT)
-    )
+    application = ApplicationBuilder().token(TG_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_image))
+    application.add_handler(MessageHandler(filters.Document.IMAGE, handle_document))
+    application.add_handler(MessageHandler(~(filters.PHOTO | filters.Document.IMAGE), handle_other))
+
+    logging.info("✅ Бот успешно запущен.")
+    await application.run_polling()
 
 if __name__ == "__main__":
-    import nest_asyncio; nest_asyncio.apply()
-    logging.basicConfig(level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        stream=sys.stdout)
+    import nest_asyncio
+    nest_asyncio.apply()
+
     asyncio.run(main())
